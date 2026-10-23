@@ -83,9 +83,10 @@ const MTIME_RESOLUTION_MS = 2000;
 export class DirListings {
   private readonly listings = new Map<string, Listing>();
 
-  /** The entry names of `dir`, empty when it cannot be read. */
-  async names(dir: string): Promise<string[]> {
-    return (await this.listing(dir, await statOrUndefined(dir))).names;
+  /** The entry names of `dir`. With `strict`, only an absent directory is
+   *  empty; permission and other read failures reject. */
+  async names(dir: string, strict = false): Promise<string[]> {
+    return (await this.listing(dir, await statOrUndefined(dir, strict), strict)).names;
   }
 
   /** The entry names of each of `dirs`, one bounded batch of stats. */
@@ -94,13 +95,19 @@ export class DirListings {
     return Promise.all(dirs.map(async (dir, i) => (await this.listing(dir, stats[i])).names));
   }
 
-  private async listing(dir: string, stats: fs.Stats | undefined): Promise<Listing> {
+  private async listing(
+    dir: string,
+    stats: fs.Stats | undefined,
+    strict = false,
+  ): Promise<Listing> {
     if (!stats?.isDirectory()) {
+      if (strict && stats) throw new Error(`Session store is not a directory: ${dir}`);
       this.listings.delete(dir);
       return { mtimeMs: 0, ino: 0, readAt: 0, names: [] };
     }
     const cached = this.listings.get(dir);
     if (
+      !strict &&
       cached &&
       cached.mtimeMs === stats.mtimeMs &&
       cached.ino === stats.ino &&
@@ -112,7 +119,8 @@ export class DirListings {
     let names: string[];
     try {
       names = await fs.promises.readdir(dir);
-    } catch {
+    } catch (error) {
+      if (strict && (error as { code?: string }).code !== "ENOENT") throw error;
       return { mtimeMs: 0, ino: 0, readAt, names: [] };
     }
     const listing: Listing = { mtimeMs: stats.mtimeMs, ino: stats.ino, readAt, names };
@@ -121,9 +129,26 @@ export class DirListings {
   }
 }
 
-function statOrUndefined(target: string): Promise<fs.Stats | undefined> {
+function isAbsent(error: unknown): boolean {
+  return ["ENOENT", "ENOTDIR"].includes((error as { code?: string }).code ?? "");
+}
+
+function statOrUndefined(target: string, strict = false): Promise<fs.Stats | undefined> {
   return fs.promises.stat(target).then(
     (stats) => stats,
-    () => undefined,
+    async (error) => {
+      if (strict) {
+        if ((error as { code?: string }).code !== "ENOENT") throw error;
+        const exists = await fs.promises.lstat(target).then(
+          () => true,
+          (error) => {
+            if (!isAbsent(error)) throw error;
+            return false;
+          },
+        );
+        if (exists) throw error;
+      }
+      return undefined;
+    },
   );
 }
