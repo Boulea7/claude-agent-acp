@@ -58,7 +58,6 @@ import {
   ARCHIVED_FILTERS,
   readSidecarTitle,
   SessionIndex,
-  SessionStoreUnavailableError,
   type ArchivedFilter,
   type ListCursor,
 } from "./session-index.js";
@@ -550,19 +549,15 @@ export class SessionIndexService {
     { sessionIds }: BatchGetSessionsRequest,
     own: (sessionId: string) => OwnSessionState | undefined,
   ): Promise<BatchGetSessionsResponse> {
-    const result: BatchGetSessionsResponse = { sessions: [] };
-    if (sessionIds.length === 0) return result;
+    if (sessionIds.length === 0) return { sessions: [] };
     const live = await this.registry.snapshot();
     const now = this.now();
-    for (const sessionId of sessionIds) {
-      try {
-        const row = await this.index.getSession(sessionId);
-        if (row) result.sessions.push(sessionInfoOf(row, own(sessionId), live.get(sessionId), now));
-      } catch (error) {
-        if (error instanceof SessionStoreUnavailableError) throw error;
-      }
-    }
-    return result;
+    const rows = await this.index.getSessions(sessionIds);
+    return {
+      sessions: rows.map((row) =>
+        sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now),
+      ),
+    };
   }
 
   /** Runs `mutation` after the previous mutation of the session ended. */

@@ -99,6 +99,24 @@ export type TranscriptCandidate = {
   ino: number;
 };
 
+type TranscriptFile = Pick<
+  TranscriptCandidate,
+  "sessionId" | "filePath" | "dirName" | "projectPath"
+>;
+
+/** Non-empty transcript files, with bounded stats shared by lists and id lookups. */
+async function transcriptCandidates(
+  files: readonly TranscriptFile[],
+): Promise<TranscriptCandidate[]> {
+  const stats = await statFiles(files.map(({ filePath }) => filePath));
+  return files.flatMap((file, i) => {
+    const current = stats[i];
+    return current?.isFile() && current.size > 0
+      ? [{ ...file, mtimeMs: current.mtimeMs, size: current.size, ino: current.ino }]
+      : [];
+  });
+}
+
 /** The cached metadata of one transcript. */
 type TranscriptMetadata = {
   /** The visible title: without the archive prefix. */
@@ -528,25 +546,16 @@ export class SessionIndex {
     const listed = await this.listings.namesOfAll(dirPaths);
     const files = dirs.flatMap(({ dirName, projectPath }, i) =>
       listed[i]!.filter((name) => name.endsWith(".jsonl") && isSessionId(name.slice(0, -6))).map(
-        (name) => ({ name, filePath: path.join(root, dirName, name), dirName, projectPath }),
+        (name) => ({
+          sessionId: name.slice(0, -6),
+          filePath: path.join(root, dirName, name),
+          dirName,
+          projectPath,
+        }),
       ),
     );
-    const stats = await statFiles(files.map(({ filePath }) => filePath));
-    const all: TranscriptCandidate[] = [];
-    files.forEach(({ name, filePath, dirName, projectPath }, i) => {
-      const fileStats = stats[i];
-      if (!fileStats?.isFile() || fileStats.size === 0) return;
-      all.push({
-        sessionId: name.slice(0, -6),
-        filePath,
-        dirName,
-        projectPath,
-        mtimeMs: fileStats.mtimeMs,
-        size: fileStats.size,
-        ino: fileStats.ino,
-      });
-    });
-    return { dirs: [root, ...dirPaths], names: [rootNames, ...listed], candidates: all };
+    const candidates = await transcriptCandidates(files);
+    return { dirs: [root, ...dirPaths], names: [rootNames, ...listed], candidates };
   }
 
   /**
@@ -582,9 +591,10 @@ export class SessionIndex {
     };
   }
 
-  /** One known id across every project, using the same rows as the list.
-   *  Addresses exact transcript filenames without listing historical files. */
-  async getSession(sessionId: string): Promise<IndexRow | undefined> {
+  /** Known ids in request order, using the same rows as the list.
+   *  Reads the project names once, then addresses only exact transcript filenames. */
+  async getSessions(sessionIds: readonly string[]): Promise<IndexRow[]> {
+    if (sessionIds.length === 0) return [];
     const root = projectsRoot();
     let dirs: string[];
     try {
@@ -596,45 +606,44 @@ export class SessionIndex {
           () => false,
           (error) => (error as { code?: string }).code === "ENOENT",
         ));
-      if (absent) return undefined;
+      if (absent) return [];
       throw new SessionStoreUnavailableError("Session store could not be read", { cause });
     }
-    if (!isSessionId(sessionId)) return undefined;
-    const candidates = (
-      await Promise.all(
-        dirs.map(async (dirName) => {
-          const filePath = path.join(root, dirName, `${sessionId}.jsonl`);
+    const ids = sessionIds.filter(isSessionId);
+    let candidates = await transcriptCandidates(
+      dirs.flatMap((dirName) =>
+        ids.map((sessionId) => ({
+          sessionId,
+          filePath: path.join(root, dirName, `${sessionId}.jsonl`),
+          dirName,
+        })),
+      ),
+    );
+    if (CASE_INSENSITIVE_PATHS) {
+      const exact = await Promise.all(
+        candidates.map(async ({ filePath }) => {
           try {
-            const stats = await fs.stat(filePath);
-            if (!stats.isFile() || stats.size === 0) return undefined;
-            if (CASE_INSENSITIVE_PATHS) {
-              const actual = path.basename(await fs.realpath(filePath));
-              const expected = path.basename(filePath);
-              if (actual !== expected && actual.toLowerCase() === expected.toLowerCase()) {
-                return undefined;
-              }
-            }
-            return {
-              sessionId,
-              filePath,
-              dirName,
-              mtimeMs: stats.mtimeMs,
-              size: stats.size,
-              ino: stats.ino,
-            };
+            const actual = path.basename(await fs.realpath(filePath));
+            const expected = path.basename(filePath);
+            return actual === expected || actual.toLowerCase() !== expected.toLowerCase();
           } catch {
-            return undefined;
+            return false;
           }
         }),
-      )
-    ).filter((candidate) => candidate !== undefined);
+      );
+      candidates = candidates.filter((_, i) => exact[i]);
+    }
     const rows = await this.collectRows(candidates.sort(byMtimeDescending), {
       inScope: scopeOf(undefined),
       archived: "all",
       wanted: Infinity,
       unread: () => [],
     });
-    return rows[0];
+    const byId = new Map(rows.map((row) => [row.sessionId, row]));
+    return sessionIds.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [row] : [];
+    });
   }
 
   /** Every transcript file of `sessionId` (see {@link scanSession}). Empty

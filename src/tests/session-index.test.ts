@@ -50,6 +50,11 @@ import {
 } from "./session-doubles.js";
 import { Pushable } from "../utils.js";
 
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof fs>();
+  return { ...actual, readdir: vi.fn(actual.readdir) };
+});
+
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
   return {
@@ -394,7 +399,7 @@ describe("_session/batch_get", () => {
   it("returns empty results without touching the store", async () => {
     const { agent } = await indexAgent();
     const index = (agent as any).sessionIndex.service.index;
-    const lookup = vi.spyOn(index, "getSession").mockRejectedValue(new Error("store down"));
+    const lookup = vi.spyOn(index, "getSessions").mockRejectedValue(new Error("store down"));
     expect(await agent.batchGetSessions({ sessionIds: [] })).toEqual({
       sessions: [],
     });
@@ -415,7 +420,14 @@ describe("_session/batch_get", () => {
     const base = Date.parse("2026-03-01T00:00:00Z");
     const ids: string[] = [];
     for (let i = 0; i < 55; i++) {
-      ids.push((await writeTranscript({ lastMessageAt: base - i * 60_000 })).id);
+      ids.push(
+        (
+          await writeTranscript({
+            cwd: path.join(workspace, `project-${i % 2}`),
+            lastMessageAt: base - i * 60_000,
+          })
+        ).id,
+      );
     }
     const recent = await indexAgent();
     const page = await recent.agent.listSessions({});
@@ -426,15 +438,26 @@ describe("_session/batch_get", () => {
     const index = (agent as any).sessionIndex.service.index;
     const list = vi.spyOn(index, "list").mockRejectedValue(new Error("must not list"));
     const names = vi.spyOn(index.listings, "namesOfAll").mockRejectedValue(new Error("history"));
-    const wanted = [ids[54]!, ids[52]!, ids[0]!];
-    const result = await agent.batchGetSessions({ sessionIds: wanted });
-    expect(result.sessions.map((s) => s.sessionId)).toEqual(wanted);
-    expect(transcriptsRead(agent)).toBe(wanted.length);
-    expect(list).not.toHaveBeenCalled();
-    expect(names).not.toHaveBeenCalled();
-    expect(listSessions).not.toHaveBeenCalled();
-    expect(getSessionInfo).not.toHaveBeenCalled();
-    await agent.dispose();
+    const wanted = [ids[54]!, ids[53]!, ids[0]!];
+    const readdir = vi.mocked(fs.readdir);
+    readdir.mockClear();
+    try {
+      const result = await agent.batchGetSessions({ sessionIds: wanted });
+      expect(result.sessions.map((s) => s.sessionId)).toEqual(wanted);
+      expect(transcriptsRead(agent)).toBe(wanted.length);
+      const root = path.join(configDir, "projects");
+      const storeReads = readdir.mock.calls
+        .map(([dir]) => String(dir))
+        .filter((dir) => dir === root || dir.startsWith(root + path.sep));
+      expect(storeReads).toEqual([root]);
+      expect(list).not.toHaveBeenCalled();
+      expect(names).not.toHaveBeenCalled();
+      expect(listSessions).not.toHaveBeenCalled();
+      expect(getSessionInfo).not.toHaveBeenCalled();
+    } finally {
+      readdir.mockClear();
+      await agent.dispose();
+    }
   });
 
   it("returns the same unscoped list rows for archived, worktree and duplicate copies in request order", async () => {
@@ -464,7 +487,9 @@ describe("_session/batch_get", () => {
     const { agent } = await indexAgent();
     const requested = [worktreeId, archived.id, copyId];
     const result = await agent.batchGetSessions({ sessionIds: requested });
+    const read = transcriptsRead(agent);
     const listed = await agent.listSessions({ _meta: listMeta({ archived: "all" }) });
+    expect(transcriptsRead(agent)).toBe(read);
     expect(result.sessions).toEqual(
       requested.map((id) => listed.sessions.find((s) => s.sessionId === id)),
     );
