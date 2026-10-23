@@ -38,7 +38,7 @@ import {
 import { LiveSessionRegistry } from "./live-registry.js";
 import {
   canonicalPath,
-  errorCode,
+  exists,
   isExactProjectDir,
   isSessionId,
   projectDirMatches,
@@ -386,16 +386,6 @@ async function isTranscriptOf(transcript: string, paths: readonly string[]): Pro
 
 function isSdkNotFound(error: unknown): boolean {
   return error instanceof Error && /^Session \S+ not found in /.test(error.message);
-}
-
-async function exists(target: string): Promise<boolean> {
-  try {
-    await fs.lstat(target);
-    return true;
-  } catch (error) {
-    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return false;
-    throw error;
-  }
 }
 
 /** The error the SDK `deleteSession` gives for a session id it rejects or

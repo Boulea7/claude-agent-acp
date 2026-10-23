@@ -26,6 +26,8 @@ import { effectiveTitle, visibleTitle } from "./archive-title.js";
 import {
   canonicalPath,
   encodeProjectPath,
+  errorCode,
+  exists,
   isExactProjectDir,
   isSessionId,
   normalizePath,
@@ -596,22 +598,18 @@ export class SessionIndex {
   async getSessions(sessionIds: readonly string[]): Promise<IndexRow[]> {
     if (sessionIds.length === 0) return [];
     const root = projectsRoot();
-    let dirs: string[];
+    let projectEntries: string[];
     try {
-      dirs = await fs.readdir(root);
+      projectEntries = await fs.readdir(root);
     } catch (cause) {
-      const absent =
-        (cause as { code?: string }).code === "ENOENT" &&
-        (await fs.lstat(root).then(
-          () => false,
-          (error) => (error as { code?: string }).code === "ENOENT",
-        ));
-      if (absent) return [];
+      if (errorCode(cause) === "ENOENT" && !(await exists(root))) {
+        return [];
+      }
       throw new SessionStoreUnavailableError("Session store could not be read", { cause });
     }
     const ids = sessionIds.filter(isSessionId);
     let candidates = await transcriptCandidates(
-      dirs.flatMap((dirName) =>
+      projectEntries.flatMap((dirName) =>
         ids.map((sessionId) => ({
           sessionId,
           filePath: path.join(root, dirName, `${sessionId}.jsonl`),
