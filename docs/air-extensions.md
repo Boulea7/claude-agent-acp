@@ -1445,17 +1445,16 @@ The CLI cleanup still deletes old transcripts (`cleanupPeriodDays`), archived or
 
 ### Batch get
 
-`_session/batch_get` reads metadata for known session IDs, including pinned sessions
-and folder members outside the recent list page. AIR must check for
+`_session/batch_get` refreshes metadata for retained session IDs, such as pinned
+sessions and folder members outside the recent list page. Check for
 `sessionBatchGet` in `initialize.result._meta.jetbrains.air.capabilities` before
-calling it. This is an AIR extension; the base ACP schema and SDK are unchanged.
+calling it.
 
 The params object must contain only `sessionIds`: an array of 0–100 distinct,
 non-empty strings. IDs match exactly, without trimming or case normalization.
 Malformed params, duplicates, more than 100 IDs, or extra fields return
-`Invalid params` (`-32602`). There is no `cwd`, `archived`, `includeWorktrees`,
-`limit`, pagination or cursor. Archived sessions and sessions in other projects
-or worktrees are eligible; AIR applies display filters itself.
+`Invalid params` (`-32602`). Archived sessions and sessions in other projects
+or worktrees are eligible.
 
 ```json
 {
@@ -1479,46 +1478,26 @@ or worktrees are eligible; AIR applies display filters itself.
         "updatedAt": "2026-01-01T00:00:00.000Z",
         "_meta": { "jetbrains": { "air": { "version": 1, "archived": false } } }
       }
-    ],
-    "missing": ["oldC"],
-    "errors": [
-      {
-        "sessionId": "oldB",
-        "code": "unavailable",
-        "message": "Session metadata could not be read"
-      }
     ]
   }
 }
 ```
 
-The example IDs are placeholders for stored Claude session UUIDs. Every requested
-ID appears in exactly one result bucket:
+The example IDs are placeholders for stored Claude session UUIDs. `sessions`
+contains the same full rows as `session/list` without a project filter, including
+archived sessions and `_meta.jetbrains.air`. Copies use the same
+newest-readable-copy selection as the list. Returned sessions preserve their
+relative request order. Absent, unreadable or ambiguous IDs are omitted.
 
-- `sessions` contains full `session/list` rows, including `_meta.jetbrains.air`,
-  in request order. It uses the same row builders and newest readable copy
-  selection as `session/list` without `cwd`, with every archive state included.
-- `missing` contains IDs confirmed to have no record in the store. Absence does
-  not authorize automatic pin or folder cleanup: AIR keeps those references and
-  may show them as unavailable.
-- `errors` contains `{ sessionId, code: "unavailable", message?: string }` for
-  records that exist or may exist but cannot supply metadata. Unreadable records
-  never become `missing`. This includes empty or corrupt transcripts, a session
-  directory left without a transcript, and a transcript whose cwd cannot be
-  recovered from its own metadata or the existing metadata cache.
+`{ "sessionIds": [] }` returns `{ "sessions": [] }` without reading the store.
+A store-wide failure, such as an unreadable projects root, rejects the request.
+Individual results reflect the store as each ID is read.
 
-`{ "sessionIds": [] }` returns `{ "sessions": [], "missing": [], "errors": [] }`
-without reading the store. The operation is not atomic: individual failures go
-in `errors`; a store-wide failure, such as an unreadable projects root, rejects
-the request. Each result bucket preserves the relative request order.
-
-The adapter uses `SessionIndex.scanSession` to stat only the requested IDs in
-each project directory, then reads metadata for their copies. It does not list
-historical transcript filenames, read unrelated transcripts to recover a cwd,
-load or resume sessions. Work depends on the requested IDs and project
-directories, rather than the total session history. Merge successful rows with
-the recent page by `sessionId`; keep missing and failed IDs pinned. A batch read
-does not subscribe to changes or expand an existing subscription's scope.
+Lookup addresses only the requested transcript filenames in each project
+and reads their metadata. Work depends on the requested IDs and project
+directories, rather than the total session history. Merge returned rows with
+the recent page by `sessionId`. A batch read does not expand an existing list
+subscription's scope; refresh retained IDs outside that scope explicitly.
 
 ### List subscription
 

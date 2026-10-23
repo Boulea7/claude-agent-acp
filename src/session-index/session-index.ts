@@ -553,68 +553,25 @@ export class SessionIndex {
    * Every transcript (with its size) and every `<sessionId>/` directory
    * (sidecar, subagent transcripts) of the session, in any project
    * directory, by the exact id. One pass over the (cached) project directory
-   * listings. With `strict`, stat only the requested paths instead, preserving
-   * unreadable records as unavailable and rejecting a failed root listing.
+   * listings.
    */
   async scanSession(
     sessionId: string,
-    { strict = false }: { strict?: boolean } = {},
-  ): Promise<{
-    transcripts: { filePath: string; size: number }[];
-    sessionDirs: string[];
-    unavailable?: boolean;
-  }> {
+  ): Promise<{ transcripts: { filePath: string; size: number }[]; sessionDirs: string[] }> {
     if (!isSessionId(sessionId)) return { transcripts: [], sessionDirs: [] };
     const root = projectsRoot();
-    let dirs: string[];
-    try {
-      dirs = (await this.listings.names(root, strict)).map((dirName) => path.join(root, dirName));
-    } catch (cause) {
-      throw new SessionStoreUnavailableError("Session store could not be read", { cause });
-    }
-    // Batch reads address the id directly in each project. They never list
-    // the filenames of a project's historical transcripts.
-    const listed = strict ? [] : await this.listings.namesOfAll(dirs);
+    const dirs = (await this.listings.names(root)).map((dirName) => path.join(root, dirName));
+    const listed = await this.listings.namesOfAll(dirs);
     const transcriptName = `${sessionId}.jsonl`;
     const transcriptPaths = dirs.flatMap((dir, i) =>
-      strict || listed[i]!.includes(transcriptName) ? [path.join(dir, transcriptName)] : [],
+      listed[i]!.includes(transcriptName) ? [path.join(dir, transcriptName)] : [],
     );
     const dirPaths = dirs.flatMap((dir, i) =>
-      strict || listed[i]!.includes(sessionId) ? [path.join(dir, sessionId)] : [],
+      listed[i]!.includes(sessionId) ? [path.join(dir, sessionId)] : [],
     );
-    let unavailable = false;
-    const stat = async (target: string, directory = false) => {
-      try {
-        const stats = await (directory ? fs.lstat(target) : fs.stat(target));
-        if (strict && (process.platform === "darwin" || process.platform === "win32")) {
-          const actual = path.basename(await fs.realpath(target));
-          const expected = path.basename(target);
-          if (actual !== expected && actual.toLowerCase() === expected.toLowerCase()) {
-            // realpath names a symlink's target, so its case alone cannot
-            // establish that the requested entry is absent.
-            if ((await fs.lstat(target)).isSymbolicLink()) unavailable = true;
-            return undefined;
-          }
-        }
-        if (strict && !(directory ? stats.isDirectory() : stats.isFile())) unavailable = true;
-        return stats;
-      } catch (error) {
-        if (strict && !["ENOENT", "ENOTDIR"].includes((error as { code?: string }).code ?? "")) {
-          unavailable = true;
-        } else if (strict && !directory) {
-          // A dangling symlink still exists, but cannot supply metadata.
-          const exists = await fs.lstat(target).then(
-            () => true,
-            () => false,
-          );
-          if (exists) unavailable = true;
-        }
-        return undefined;
-      }
-    };
     const [transcriptStats, dirStats] = await Promise.all([
-      strict ? Promise.all(transcriptPaths.map((file) => stat(file))) : statFiles(transcriptPaths),
-      Promise.all(dirPaths.map((dir) => stat(dir, true))),
+      statFiles(transcriptPaths),
+      Promise.all(dirPaths.map((dir) => fs.lstat(dir).catch(() => undefined))),
     ]);
     return {
       transcripts: transcriptPaths.flatMap((filePath, i) => {
@@ -622,31 +579,52 @@ export class SessionIndex {
         return stats?.isFile() ? [{ filePath, size: stats.size }] : [];
       }),
       sessionDirs: dirPaths.filter((_, i) => dirStats[i]?.isDirectory()),
-      ...(unavailable ? { unavailable: true } : {}),
     };
   }
 
-  /** One known id, across every project, using only its transcripts. A
-   *  present record that cannot form a list row is unavailable, not missing.
-   *  No unrelated transcript is read to recover a missing cwd. */
+  /** One known id across every project, using the same rows as the list.
+   *  Addresses exact transcript filenames without listing historical files. */
   async getSession(sessionId: string): Promise<IndexRow | undefined> {
-    const { transcripts, sessionDirs, unavailable } = await this.scanSession(sessionId, {
-      strict: true,
-    });
-    if (transcripts.length === 0 && sessionDirs.length === 0 && !unavailable) return undefined;
+    const root = projectsRoot();
+    let dirs: string[];
+    try {
+      dirs = await fs.readdir(root);
+    } catch (cause) {
+      const absent =
+        (cause as { code?: string }).code === "ENOENT" &&
+        (await fs.lstat(root).then(
+          () => false,
+          (error) => (error as { code?: string }).code === "ENOENT",
+        ));
+      if (absent) return undefined;
+      throw new SessionStoreUnavailableError("Session store could not be read", { cause });
+    }
+    if (!isSessionId(sessionId)) return undefined;
     const candidates = (
       await Promise.all(
-        transcripts.map(async ({ filePath }) => {
-          const stats = await fs.stat(filePath).catch(() => undefined);
-          if (!stats?.isFile()) return undefined;
-          return {
-            sessionId,
-            filePath,
-            dirName: path.basename(path.dirname(filePath)),
-            mtimeMs: stats.mtimeMs,
-            size: stats.size,
-            ino: stats.ino,
-          };
+        dirs.map(async (dirName) => {
+          const filePath = path.join(root, dirName, `${sessionId}.jsonl`);
+          try {
+            const stats = await fs.stat(filePath);
+            if (!stats.isFile() || stats.size === 0) return undefined;
+            if (CASE_INSENSITIVE_PATHS) {
+              const actual = path.basename(await fs.realpath(filePath));
+              const expected = path.basename(filePath);
+              if (actual !== expected && actual.toLowerCase() === expected.toLowerCase()) {
+                return undefined;
+              }
+            }
+            return {
+              sessionId,
+              filePath,
+              dirName,
+              mtimeMs: stats.mtimeMs,
+              size: stats.size,
+              ino: stats.ino,
+            };
+          } catch {
+            return undefined;
+          }
         }),
       )
     ).filter((candidate) => candidate !== undefined);
@@ -656,7 +634,6 @@ export class SessionIndex {
       wanted: Infinity,
       unread: () => [],
     });
-    if (!rows[0]) throw new Error("Session metadata could not be read");
     return rows[0];
   }
 

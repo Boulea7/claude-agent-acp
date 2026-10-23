@@ -352,8 +352,6 @@ describe("_session/batch_get", () => {
       expect(airCapabilities(response)).toContain("sessionBatchGet");
       expect(await connection.agent.request("_session/batch_get", { sessionIds: [] })).toEqual({
         sessions: [],
-        missing: [],
-        errors: [],
       });
       await expect(
         connection.agent.request("_session/batch_get", { sessionIds: [], cwd: "/repo" }),
@@ -396,13 +394,20 @@ describe("_session/batch_get", () => {
   it("returns empty results without touching the store", async () => {
     const { agent } = await indexAgent();
     const index = (agent as any).sessionIndex.service.index;
-    const scan = vi.spyOn(index, "scanSession").mockRejectedValue(new Error("store down"));
+    const lookup = vi.spyOn(index, "getSession").mockRejectedValue(new Error("store down"));
     expect(await agent.batchGetSessions({ sessionIds: [] })).toEqual({
       sessions: [],
-      missing: [],
-      errors: [],
     });
-    expect(scan).not.toHaveBeenCalled();
+    expect(lookup).not.toHaveBeenCalled();
+    await agent.dispose();
+  });
+
+  it("returns no sessions when the store is absent", async () => {
+    const { agent } = await indexAgent();
+    const sessionIds = [randomUUID(), "retained-id"];
+    expect(await agent.batchGetSessions({ sessionIds })).toEqual({
+      sessions: [],
+    });
     await agent.dispose();
   });
 
@@ -424,8 +429,6 @@ describe("_session/batch_get", () => {
     const wanted = [ids[54]!, ids[52]!, ids[0]!];
     const result = await agent.batchGetSessions({ sessionIds: wanted });
     expect(result.sessions.map((s) => s.sessionId)).toEqual(wanted);
-    expect(result.missing).toEqual([]);
-    expect(result.errors).toEqual([]);
     expect(transcriptsRead(agent)).toBe(wanted.length);
     expect(list).not.toHaveBeenCalled();
     expect(names).not.toHaveBeenCalled();
@@ -465,15 +468,14 @@ describe("_session/batch_get", () => {
     expect(result.sessions).toEqual(
       requested.map((id) => listed.sessions.find((s) => s.sessionId === id)),
     );
-    expect(result.missing).toEqual([]);
-    expect(result.errors).toEqual([]);
     expect(airRow(result.sessions[1]!).archived).toBe(true);
     expect(agentWorktreeOfRow(result.sessions[0])).toBe(true);
     expect(result.sessions[2]).toMatchObject({ title: "New copy", cwd: worktree });
     await agent.dispose();
   });
 
-  it("partitions found, missing and unreadable records exactly once", async () => {
+  it("returns readable sessions in request order and omits unavailable ids", async () => {
+    const first = await writeTranscript({});
     const found = await writeTranscript({});
     const unreadable = await writeTranscript({});
     await fs.chmod(unreadable.file, 0);
@@ -481,13 +483,10 @@ describe("_session/batch_get", () => {
     const { agent } = await indexAgent();
     try {
       const result = await agent.batchGetSessions({
-        sessionIds: [absent, unreadable.id, found.id],
+        sessionIds: [absent, first.id, unreadable.id, found.id],
       });
-      expect(result.sessions.map((s) => s.sessionId)).toEqual([found.id]);
-      expect(result.missing).toEqual([absent]);
-      expect(result.errors).toEqual([
-        { sessionId: unreadable.id, code: "unavailable", message: expect.any(String) },
-      ]);
+      expect(result.sessions.map((s) => s.sessionId)).toEqual([first.id, found.id]);
+      expect(Object.keys(result)).toEqual(["sessions"]);
     } finally {
       await fs.chmod(unreadable.file, 0o600);
       await agent.dispose();
@@ -511,7 +510,7 @@ describe("_session/batch_get", () => {
         await fs.chmod(target, 0);
         const result = await agent.batchGetSessions({ sessionIds: [sessionId] });
         const listed = await agent.listSessions({});
-        expect(result).toEqual({ sessions: listed.sessions, missing: [], errors: [] });
+        expect(result).toEqual({ sessions: listed.sessions });
         expect(result.sessions[0]?.title).toBe("Readable copy");
         await fs.chmod(target, 0o700);
       }
@@ -522,7 +521,7 @@ describe("_session/batch_get", () => {
     }
   });
 
-  it("never treats a failed per-record stat, dangling link or non-file transcript as missing", async () => {
+  it("omits failed stats, dangling links and non-file transcripts", async () => {
     const unreadable = await writeTranscript({ cwd: path.join(workspace, "inaccessible") });
     const dangling = await writeTranscript({});
     await fs.rm(dangling.file);
@@ -537,13 +536,7 @@ describe("_session/batch_get", () => {
       const result = await agent.batchGetSessions({
         sessionIds: [unreadable.id, dangling.id, nonFile.id],
       });
-      expect(result.sessions).toEqual([]);
-      expect(result.missing).toEqual([]);
-      expect(result.errors.map((error) => error.sessionId)).toEqual([
-        unreadable.id,
-        dangling.id,
-        nonFile.id,
-      ]);
+      expect(result).toEqual({ sessions: [] });
     } finally {
       await fs.chmod(projectDir, 0o700);
       await agent.dispose();
@@ -558,26 +551,10 @@ describe("_session/batch_get", () => {
       sessionIds: [sessionId.toUpperCase(), ` ${sessionId} `, sessionId],
     });
     expect(result.sessions.map((row) => row.sessionId)).toEqual([sessionId]);
-    expect(result.missing).toEqual([sessionId.toUpperCase(), ` ${sessionId} `]);
-    expect(result.errors).toEqual([]);
     await agent.dispose();
   });
 
-  it("does not call an existing symlink missing when its target UUID has different case", async () => {
-    const lower = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-    const upper = lower.toUpperCase();
-    const original = await writeTranscript({ sessionId: lower });
-    const source = path.join(workspace, `${lower}.jsonl`);
-    await fs.rename(original.file, source);
-    await fs.symlink(source, path.join(path.dirname(original.file), `${upper}.jsonl`));
-    const { agent } = await indexAgent();
-    const result = await agent.batchGetSessions({ sessionIds: [upper] });
-    expect(result.missing).toEqual([]);
-    expect(result.sessions.length + result.errors.length).toBe(1);
-    await agent.dispose();
-  });
-
-  it("reports existing empty, malformed, sidecar-only and unresolved-cwd records as unavailable", async () => {
+  it("omits empty, malformed, sidecar-only and unresolved-cwd records", async () => {
     const empty = await writeTranscript({});
     await fs.writeFile(empty.file, "");
     const malformed = await writeTranscript({});
@@ -593,11 +570,7 @@ describe("_session/batch_get", () => {
     const { agent } = await indexAgent();
     const ids = [empty.id, malformed.id, sidecar, unresolved.id];
     const result = await agent.batchGetSessions({ sessionIds: ids });
-    expect(result.sessions).toEqual([]);
-    expect(result.missing).toEqual([]);
-    expect(result.errors.map((error) => [error.sessionId, error.code])).toEqual(
-      ids.map((id) => [id, "unavailable"]),
-    );
+    expect(result).toEqual({ sessions: [] });
     await agent.dispose();
   });
 
@@ -607,9 +580,11 @@ describe("_session/batch_get", () => {
     const root = path.join(configDir, "projects");
     await fs.chmod(root, 0);
     try {
-      await expect(agent.batchGetSessions({ sessionIds: [found.id] })).rejects.toThrow(
-        "Session store could not be read",
-      );
+      for (const sessionId of [found.id, "retained-id"]) {
+        await expect(agent.batchGetSessions({ sessionIds: [sessionId] })).rejects.toThrow(
+          "Session store could not be read",
+        );
+      }
     } finally {
       await fs.chmod(root, 0o700);
       await agent.dispose();
@@ -625,9 +600,11 @@ describe("_session/batch_get", () => {
     await agent.listSessions({});
     await fs.chmod(root, 0);
     try {
-      await expect(agent.batchGetSessions({ sessionIds: [found.id] })).rejects.toThrow(
-        "Session store could not be read",
-      );
+      for (const sessionId of [found.id, "retained-id"]) {
+        await expect(agent.batchGetSessions({ sessionIds: [sessionId] })).rejects.toThrow(
+          "Session store could not be read",
+        );
+      }
     } finally {
       await fs.chmod(root, 0o700);
       await agent.dispose();

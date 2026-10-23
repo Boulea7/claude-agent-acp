@@ -79,8 +79,6 @@ export type RenameSessionRequest = { sessionId: string; title: string };
 export type BatchGetSessionsRequest = { sessionIds: string[] };
 export type BatchGetSessionsResponse = {
   sessions: SessionInfo[];
-  missing: string[];
-  errors: { sessionId: string; code: "unavailable"; message?: string }[];
 };
 
 export function parseBatchGetSessionsRequest(value: unknown): BatchGetSessionsRequest {
@@ -552,7 +550,7 @@ export class SessionIndexService {
     { sessionIds }: BatchGetSessionsRequest,
     own: (sessionId: string) => OwnSessionState | undefined,
   ): Promise<BatchGetSessionsResponse> {
-    const result: BatchGetSessionsResponse = { sessions: [], missing: [], errors: [] };
+    const result: BatchGetSessionsResponse = { sessions: [] };
     if (sessionIds.length === 0) return result;
     const live = await this.registry.snapshot();
     const now = this.now();
@@ -560,14 +558,8 @@ export class SessionIndexService {
       try {
         const row = await this.index.getSession(sessionId);
         if (row) result.sessions.push(sessionInfoOf(row, own(sessionId), live.get(sessionId), now));
-        else result.missing.push(sessionId);
       } catch (error) {
         if (error instanceof SessionStoreUnavailableError) throw error;
-        result.errors.push({
-          sessionId,
-          code: "unavailable",
-          message: "Session metadata could not be read",
-        });
       }
     }
     return result;
